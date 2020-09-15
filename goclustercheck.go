@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -35,19 +36,14 @@ var defaultTimeout = 10 * time.Second
 var defaultCheckInterval = 5 * time.Second
 
 var mysqlBin = flag.String("mysql-binary", "mysql", "Path to mysql binary")
-var username = flag.String("username", "clustercheckuser", "MySQL Username")
-var password = flag.String("password", "clustercheckpassword!", "MySQL Password")
-var socket = flag.String("socket", "", "MySQL UNIX Socket")
-var host = flag.String("host", "", "MySQL Server")
-var port = flag.Int("port", 3306, "MySQL Port")
-var timeout = flag.Duration("timeout", defaultTimeout, "MySQL connection timeout")
+var timeout = flag.Duration("timeout", defaultTimeout, "Status check timeout")
 var checkInterval = flag.Duration("checkInterval", defaultCheckInterval, "How often to check mysql status")
-var availableWhenDonor = flag.Bool("donor", false, "Cluster available while node is a donor")
-var availableWhenReadonly = flag.Bool("readonly", false, "Cluster available while node is read only")
-var forceFailFile = flag.String("failfile", "/dev/shm/proxyoff", "Create this file to manually fail checks")
-var forceUpFile = flag.String("upfile", "/dev/shm/proxyon", "Create this file to manually pass checks")
-var bindPort = flag.Int("bindport", 9200, "MySQLChk bind port")
-var bindAddr = flag.String("bindaddr", "", "MySQLChk bind address")
+var availableWhenDonor = flag.Bool("donor", false, "Available while node is a donor")
+var availableWhenReadonly = flag.Bool("readonly", false, "Available while node is read only")
+var forceFailFile = flag.String("failfile", "/dev/shm/proxyoff", "Force fail")
+var forceUpFile = flag.String("upfile", "/dev/shm/proxyon", "Force pass")
+var bindPort = flag.Int("bindport", 9200, "HTTP bind port")
+var bindAddr = flag.String("bindaddr", "", "HTTP bind address")
 
 func checkHandler(w http.ResponseWriter, r *http.Request) {
 	if _, err := os.Stat(*forceUpFile); err == nil {
@@ -68,7 +64,7 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getStatus(commandArgs *[]string) (statusValues, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, *mysqlBin, *commandArgs...)
@@ -78,7 +74,10 @@ func getStatus(commandArgs *[]string) (statusValues, error) {
 
 	err := cmd.Run()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get status: %q", stderr.String())
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("Timed out waiting for status query to complete")
+		}
+		return nil, fmt.Errorf("Failed to get status: %s (stderr: %q)", err, stderr.String())
 	}
 
 	propVals := statusValues{}
@@ -114,35 +113,37 @@ func checkWsrep() state {
 	return state{available, wsrepState["wsrep_local_state_comment"]}
 }
 
+func updateState() {
+	lastState := currentState
+	currentState = checkWsrep()
+	if lastState.comment != currentState.comment {
+		log.Printf("Status changed! Now \"%s\", Was \"%s\"\n", currentState.comment, lastState.comment)
+	}
+}
+
 func main() {
+	flag.Usage = func() {
+		fmt.Printf("Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+		fmt.Println("\nAny agruments following \"--\" are passed directly to the mysql command")
+		fmt.Println("and can be used to specify command-line options such has host, port, user, etc.")
+	}
+
 	flag.Parse()
 
-	checkCommandArgs = []string{
-		"-n", "-N", "-s",
-		fmt.Sprintf("--user=%s", *username),
-		fmt.Sprintf("--password=%s", *password),
-		fmt.Sprintf("--connect-timeout=%d", int(timeout.Seconds())),
-	}
-	if *socket != "" {
-		checkCommandArgs = append(checkCommandArgs, fmt.Sprintf("--socket=%s", *socket))
-	} else if *host != "" {
-		checkCommandArgs = append(checkCommandArgs, fmt.Sprintf("--host=%s", *host))
-		checkCommandArgs = append(checkCommandArgs, fmt.Sprintf("--port=%d", *port))
-	}
+	checkCommandArgs = os.Args[len(os.Args)-flag.NArg():]
+	checkCommandArgs = append(checkCommandArgs, "-n", "-N", "-s")
 
 	query := "show status where Variable_name in ('read_only', 'wsrep_local_state', 'wsrep_local_state_comment');"
 	checkCommandArgs = append(checkCommandArgs, "-e", query)
 
-	// Get Initial State
-	currentState = checkWsrep()
+	currentState = state{false, "Initializing"}
 
 	go func() {
+		// Get Initial State
+		updateState()
 		for range time.Tick(*checkInterval) {
-			lastState := currentState
-			currentState = checkWsrep()
-			if lastState.comment != currentState.comment {
-				log.Printf("Status changed! Now \"%s\", Was \"%s\"\n", currentState.comment, lastState.comment)
-			}
+			updateState()
 		}
 	}()
 
